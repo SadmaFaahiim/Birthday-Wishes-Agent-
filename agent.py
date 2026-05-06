@@ -2,13 +2,9 @@ import asyncio
 import json
 import logging
 import sqlite3
-import sys
 import time
-from dataclasses import dataclass, field
 from datetime import date, datetime
-from enum import Enum
 from pathlib import Path
-from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from browser_use import Agent, Browser, BrowserConfig
@@ -56,15 +52,11 @@ from rag_memory import (init_rag_memory, save_memory_to_rag,
                          retrieve_relevant_memory, generate_rag_wish,
                          migrate_from_sqlite_memory)
 from voice_to_text import run_voice_reply_task as run_voice_to_text_task
-from voice import generate_voice
 from email_digest import send_weekly_digest
-from personality_profiling import (
-    init_personality_table,
-    run_personality_profiling,
-    generate_personality_aware_wish,
-    get_personality_profile,
-    get_personality_stats,
-)
+from voice import generate_voice
+from personality_profiling import (init_personality_table, analyze_personality,
+                                   get_personality_profile,
+                                   build_personality_instructions)
 
 # ──────────────────────────────────────────────
 # 1. LOGGING SETUP
@@ -79,11 +71,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── EMAIL DIGEST ──────────────────────────────
-EMAIL_DIGEST_ENABLED = True
-DIGEST_DAY           = "monday"
-# ──────────────────────────────────────────────
 
+# ──────────────────────────────────────────────
 # 2. CONFIG & CREDENTIALS
 # ──────────────────────────────────────────────
 config = dotenv_values(".env")
@@ -117,42 +106,6 @@ SENTIMENT_ANALYSIS_ENABLED = True
 # ── AUTO-CONNECT ──────────────────────────────
 AUTO_CONNECT_ENABLED = True
 MAX_CONNECTS_PER_DAY = 10
-
-# ── FEATURE FLAGS ─────────────────────────────
-MEMORY_ENABLED              = True
-POST_ENGAGEMENT_ENABLED     = True
-BIRTHDAY_REMINDER_ENABLED   = True
-GROUP_BIRTHDAY_ENABLED      = True
-AUTO_REPLY_FOLLOWUP_ENABLED = True
-OCCASION_DETECTION_ENABLED  = True
-DM_CAMPAIGN_ENABLED         = False
-CONTACT_CATEGORIZER_ENABLED = True
-HEALTH_REPORT_ENABLED       = True
-RAG_MEMORY_ENABLED          = False
-CONNECTION_TRACKER_ENABLED  = True
-
-# ── PERSONALITY PROFILING ─────────────────────
-PERSONALITY_PROFILING_ENABLED    = True
-MAX_PERSONALITY_PROFILES_PER_DAY = 10
-
-# ── MULTI-AGENT ORCHESTRATOR SETTINGS ─────────
-PARALLEL_MODE           = True
-MAX_BROWSER_CONCURRENCY = 3
-
-# ── MISC SETTINGS ─────────────────────────────
-TRANSCRIPTION_ENGINE       = "whisper"
-ENGAGEMENT_MODE            = "like_and_comment"
-MAX_ENGAGEMENTS_PER_DAY    = 10
-MAX_GROUP_ENGAGEMENTS      = 5
-GROUP_COMMENT_ENABLED      = True
-GROUP_DM_ENABLED           = True
-MAX_AUTO_REPLIES_PER_DAY   = 20
-HEALTH_REPORT_DAY          = "Monday"
-CATEGORIZER_MAX_CONTACTS   = 100
-CAMPAIGN_TYPE              = "new_connections"
-MAX_DM_PER_DAY             = 20
-DM_COOLDOWN_DAYS           = 30
-CAMPAIGN_VARIANT           = "A"
 
 if not USERNAME or not PASSWORD:
     raise EnvironmentError("❌ USERNAME or PASSWORD missing in .env")
@@ -611,7 +564,7 @@ async def run_memory_wish_task():
 
     task = f"""
   Open the browser.
-  {"You are already logged into LinkedIn. Skip login." if logged_in else ""}
+  {"You are already logged into LinkedIn. Skip login." if True else ""}
   {dry_run_notice()}
   {filter_notice("LinkedIn-BirthdayDetection")}
 
@@ -648,6 +601,19 @@ async def run_memory_wish_task():
     save_session_timestamp()
     send_summary("LinkedIn - Memory-Aware Wishes", [], 0, DRY_RUN)
     return result
+
+
+async def run_email_digest_task():
+    """Send weekly digest email with wishes, upcoming birthdays, fading connections."""
+    logger.info("=== Weekly Email Digest === [DRY RUN: %s]", DRY_RUN)
+    data = await send_weekly_digest(dry_run=DRY_RUN)
+    logger.info(
+        "📧 Digest: %d actions | %d upcoming | %d fading",
+        data["wishes"]["total"],
+        len(data["upcoming_birthdays"]),
+        len(data["fading_connections"]),
+    )
+    return data
 
 
 async def run_voice_to_text_reply_task():
@@ -687,6 +653,32 @@ async def run_rag_wish_task():
     save_session_timestamp()
     send_summary("RAG Birthday Wishes", [], 0, DRY_RUN)
     return result
+
+
+async def run_personality_task(contacts: list[dict] = None):
+    """Analyze personality profiles for contacts from their LinkedIn posts."""
+    logger.info("=== Personality Profiling ===")
+    if not contacts:
+        logger.info("📭 No contacts provided for personality analysis.")
+        return []
+    results = []
+    for c in contacts:
+        profile = await analyze_personality(
+            llm=llm,
+            browser=browser,
+            contact=c.get("name", ""),
+            profile_url=c.get("profile_url", ""),
+            already_logged_in=session_is_valid(),
+            username=USERNAME,
+            password=PASSWORD,
+        )
+        if profile:
+            results.append({"contact": c.get("name"), "profile": profile})
+            logger.info("🎭 %s → %s (%s)",
+                        c.get("name"),
+                        profile.get("mbti_type", "?"),
+                        profile.get("communication_style", "?"))
+    return results
 
 
 async def run_categorizer_task():
@@ -827,6 +819,7 @@ async def run_post_engagement_task():
     logger.info("=== LinkedIn Post Engagement === [DRY RUN: %s | MODE: %s]",
                 DRY_RUN, ENGAGEMENT_MODE)
 
+    # Sample contacts — in production these come from birthday detection result
     sample_contacts = [
         {"name": "Birthday Contact", "profile_url": "", "relationship": "colleague"}
     ]
@@ -843,396 +836,98 @@ async def run_post_engagement_task():
     return result
 
 
-async def run_email_digest_task():
-    """Send weekly digest email."""
-    logger.info("=== Weekly Email Digest === [DRY RUN: %s]", DRY_RUN)
-    data = await send_weekly_digest(dry_run=DRY_RUN)
-    return data
-
-
 # ──────────────────────────────────────────────
-# PERSONALITY PROFILING TASK
+# 14. DAILY JOB (all platforms)
 # ──────────────────────────────────────────────
 async def run_personality_profiling_task(contacts: list[dict] = None):
-    """
-    Birthday contacts-দের LinkedIn posts analyze করে personality type detect করে।
-    তারপর সেই personality অনুযায়ী personalized birthday wish generate করে।
-
-    contacts format:
-        [{"name": "Rahul Ahmed", "profile_url": "https://linkedin.com/in/rahul-ahmed"}]
-
-    Personality profile SQLite-এ save হয়, পরের বছরও reuse হবে।
-    """
-    logger.info(
-        "=== Personality Profiling === [DRY RUN: %s | MAX: %d]",
-        DRY_RUN, MAX_PERSONALITY_PROFILES_PER_DAY,
-    )
-
+    """Profile contacts from their LinkedIn posts."""
+    logger.info("=== Personality Profiling ===")
     if not contacts:
-        logger.warning(
-            "⚠️  No contacts provided for personality profiling. "
-            "Pass birthday contacts from detection result."
-        )
+        logger.info("📭 No contacts provided for profiling.")
         return []
-
     results = await run_personality_profiling(
-        contacts          = contacts,
-        llm               = llm,
-        browser           = browser,
-        already_logged_in = session_is_valid(),
-        username          = USERNAME,
-        password          = PASSWORD,
-        dry_run           = DRY_RUN,
-        max_profiles      = MAX_PERSONALITY_PROFILES_PER_DAY,
+        llm=llm,
+        browser=browser,
+        contacts=contacts,
+        already_logged_in=session_is_valid(),
+        username=USERNAME,
+        password=PASSWORD,
     )
-
     for r in results:
-        logger.info(
-            "🧠 %s → MBTI: %s | Tone: %s | Wish: %s",
-            r["contact"],
-            r["mbti_type"],
-            r["tone"],
-            r["wish"][:60] + "..." if len(r["wish"]) > 60 else r["wish"],
-        )
-
-    stats = get_personality_stats()
-    logger.info(
-        "📊 Personality DB: %d profiles | Top MBTI: %s | Avg confidence: %.2f",
-        stats["total"],
-        max(stats["by_mbti"], key=stats["by_mbti"].get) if stats["by_mbti"] else "N/A",
-        stats["avg_confidence"],
-    )
-
-    send_summary(
-        "Personality Profiling",
-        [r["contact"] for r in results],
-        0,
-        DRY_RUN,
-    )
-    save_session_timestamp()
+        logger.info("🧠 %s → %s (%.0f%% confidence)",
+                    r["contact"], r.get("communication_style"),
+                    r.get("confidence", 0) * 100)
     return results
 
 
-# ══════════════════════════════════════════════════════════════
-# 14. MULTI-AGENT ORCHESTRATOR
-# ══════════════════════════════════════════════════════════════
-
-class AgentStatus(Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCESS = "success"
-    FAILED  = "failed"
-    SKIPPED = "skipped"
-
-
-@dataclass
-class SubAgentResult:
-    name:       str
-    status:     AgentStatus
-    result:     Any   = None
-    error:      str   = ""
-    duration_s: float = 0.0
-
-    def __str__(self):
-        icon = {
-            AgentStatus.SUCCESS: "✅",
-            AgentStatus.FAILED:  "❌",
-            AgentStatus.SKIPPED: "⏭️",
-            AgentStatus.RUNNING: "⏳",
-            AgentStatus.PENDING: "🕐",
-        }[self.status]
-        return (
-            f"{icon} [{self.name}] {self.status.value.upper()} "
-            f"({self.duration_s:.1f}s)"
-            + (f" — {self.error}" if self.error else "")
-        )
-
-
-class OrchestratorAgent:
-    """
-    Orchestrator যে সব sub-agents কে manage করে।
-
-    Architecture:
-    ┌─────────────────────────────────────────────────┐
-    │              OrchestratorAgent                  │
-    │  ┌──────────────────────────────────────────┐   │
-    │  │           Task Queue / Plan              │   │
-    │  └──────────────────────────────────────────┘   │
-    │        │            │             │              │
-    │  ┌─────▼──────┐ ┌───▼──────┐ ┌───▼──────┐      │
-    │  │ Sub-Agent 1│ │Sub-Agent2│ │Sub-Agent3│ ...  │
-    │  │  LinkedIn  │ │ WhatsApp │ │ Facebook │      │
-    │  │  Birthday  │ │  Reply   │ │  Reply   │      │
-    │  └────────────┘ └──────────┘ └──────────┘      │
-    │        │            │             │              │
-    │  ┌─────▼────────────▼─────────────▼──────────┐  │
-    │  │            Result Aggregator               │  │
-    │  └────────────────────────────────────────────┘  │
-    └─────────────────────────────────────────────────┘
-
-    asyncio.Semaphore দিয়ে browser concurrency control করা হয়।
-    """
-
-    def __init__(self, max_browser_concurrency: int = MAX_BROWSER_CONCURRENCY):
-        self._browser_sem = asyncio.Semaphore(max_browser_concurrency)
-        self.results: list[SubAgentResult] = []
-        # birthday detection result share করার জন্য
-        self._birthday_contacts: list[dict] = []
-
-    async def _run_sub_agent(
-        self,
-        name: str,
-        coro_factory,
-        retries: int = 2,
-        retry_delay: int = 5,
-    ) -> SubAgentResult:
-        """একটা sub-agent run করে — semaphore + retry built-in।"""
-        start = time.monotonic()
-        last_error = ""
-
-        async with self._browser_sem:
-            logger.info("🤖 [Orchestrator] Starting sub-agent: %s", name)
-            for attempt in range(1, retries + 1):
-                try:
-                    result = await coro_factory()
-                    duration = time.monotonic() - start
-                    logger.info("✅ [%s] Done in %.1fs", name, duration)
-                    return SubAgentResult(
-                        name=name,
-                        status=AgentStatus.SUCCESS,
-                        result=result,
-                        duration_s=duration,
-                    )
-                except Exception as e:
-                    last_error = str(e)
-                    logger.warning("⚠️ [%s] Attempt %d/%d failed: %s",
-                                   name, attempt, retries, e)
-                    if attempt < retries:
-                        await asyncio.sleep(retry_delay)
-
-        duration = time.monotonic() - start
-        logger.error("💀 [%s] All attempts failed.", name)
-        return SubAgentResult(
-            name=name,
-            status=AgentStatus.FAILED,
-            error=last_error,
-            duration_s=duration,
-        )
-
-    def _build_task_list(self) -> list[tuple[str, Any]]:
-        """
-        Config toggles দেখে enabled sub-agents এর list বানায়।
-        প্রতিটা entry: (name, coro_factory)
-        """
-        tasks = []
-
+async def daily_job():
+    logger.info("⏰ Daily job started.")
+    try:
         if ENABLE_LINKEDIN:
-            tasks.append(("LinkedIn-BirthdayDetection",
-                           lambda: run_birthday_detection_task()))
-            tasks.append(("LinkedIn-ReplyToWishes",
-                           lambda: run_linkedin_reply_task()))
+            await run_birthday_detection_task()
+            await run_linkedin_reply_task()
 
         if ENABLE_WHATSAPP:
-            tasks.append(("WhatsApp-Reply",
-                           lambda: run_whatsapp_reply_task()))
+            await run_whatsapp_reply_task()
 
         if ENABLE_FACEBOOK:
-            tasks.append(("Facebook-Reply",
-                           lambda: run_facebook_reply_task()))
+            await run_facebook_reply_task()
 
         if ENABLE_INSTAGRAM:
-            tasks.append(("Instagram-Reply",
-                           lambda: run_instagram_reply_task()))
+            await run_instagram_reply_task()
 
-        tasks.append(("FollowUp-Messages",
-                       lambda: run_followup_task()))
+        await run_followup_task()
 
         if SENTIMENT_ANALYSIS_ENABLED or AUTO_CONNECT_ENABLED:
-            tasks.append(("Sentiment-AutoConnect",
-                           lambda: run_sentiment_reply_task()))
+            await run_sentiment_reply_task()
 
+        # Memory-aware birthday wishes
         if MEMORY_ENABLED:
-            tasks.append(("Memory-Aware-Wishes",
-                           lambda: run_memory_wish_task()))
+            await run_memory_wish_task()
 
+        # Post engagement (like + comment on birthday contacts' posts)
         if POST_ENGAGEMENT_ENABLED:
-            tasks.append(("Post-Engagement",
-                           lambda: run_post_engagement_task()))
+            await run_post_engagement_task()
 
+        # Birthday reminder email for tomorrow's birthdays
         if BIRTHDAY_REMINDER_ENABLED:
-            tasks.append(("Birthday-Reminder",
-                           lambda: run_birthday_reminder_task()))
+            await run_birthday_reminder_task()
 
+        # Group birthday detection
         if GROUP_BIRTHDAY_ENABLED:
-            tasks.append(("Group-Birthday",
-                           lambda: run_group_birthday_task()))
+            await run_group_birthday_task()
 
+        # Auto reply to follow-up responses
         if AUTO_REPLY_FOLLOWUP_ENABLED:
-            tasks.append(("Auto-Reply-FollowUp",
-                           lambda: run_auto_reply_task()))
+            await run_auto_reply_task()
 
+        # Occasion detection (promotion, new job, graduation, etc.)
         if OCCASION_DETECTION_ENABLED:
-            tasks.append(("Occasion-Detection",
-                           lambda: run_occasion_detection_task()))
+            await run_occasion_detection_task()
 
+        # LinkedIn DM Campaign
         if DM_CAMPAIGN_ENABLED:
-            tasks.append(("DM-Campaign",
-                           lambda: run_dm_campaign_task()))
+            await run_dm_campaign_task()
 
-        if RAG_MEMORY_ENABLED:
-            tasks.append(("RAG-Wishes",
-                           lambda: run_rag_wish_task()))
-
-        # Personality Profiling — birthday detection-এর পরে চলে
-        # Sequential mode-এ birthday contacts automatically pass হয়।
-        # Parallel mode-এ _birthday_contacts list populate হলে চলবে।
-        if PERSONALITY_PROFILING_ENABLED:
-            tasks.append(("Personality-Profiling",
-                           lambda: run_personality_profiling_task(
-                               self._birthday_contacts or []
-                           )))
-
-        return tasks
-
-    async def run_parallel(self) -> list[SubAgentResult]:
-        """
-        সব sub-agents কে parallel এ run করে।
-        Personality Profiling birthday detection complete হওয়ার পরে চলে।
-        """
-        wall_start = time.monotonic()
-
-        logger.info("=" * 60)
-        logger.info("🎯 [Orchestrator] Parallel run — DRY_RUN: %s", DRY_RUN)
-        logger.info("   Browser concurrency limit: %d", MAX_BROWSER_CONCURRENCY)
-        logger.info("=" * 60)
-
-        # ── Step 1: Birthday detection আগে চালাই (personality profiling এর জন্য দরকার)
-        if ENABLE_LINKEDIN and PERSONALITY_PROFILING_ENABLED:
-            logger.info("🤖 Running Birthday Detection first (feeds Personality Profiling)...")
-            try:
-                bd_result = await run_birthday_detection_task()
-                # Result থেকে contacts extract করার চেষ্টা
-                # (actual parsing depends on agent output format)
-                if isinstance(bd_result, list):
-                    self._birthday_contacts = bd_result
-                else:
-                    # Fallback: empty list, personality profiling gracefully skips
-                    self._birthday_contacts = []
-            except Exception as e:
-                logger.error("❌ Birthday detection failed: %s", e)
-                self._birthday_contacts = []
-
-            # বাকি tasks থেকে birthday detection সরিয়ে দিই (already ran)
-            remaining_tasks = [
-                (name, factory)
-                for name, factory in self._build_task_list()
-                if name != "LinkedIn-BirthdayDetection"
-            ]
-        else:
-            remaining_tasks = self._build_task_list()
-
-        logger.info("🚀 Launching %d remaining sub-agents in parallel...", len(remaining_tasks))
-        for name, _ in remaining_tasks:
-            logger.info("   • %s", name)
-
-        coros = [
-            self._run_sub_agent(name, factory)
-            for name, factory in remaining_tasks
-        ]
-        self.results = await asyncio.gather(*coros, return_exceptions=False)
-
-        wall_total = time.monotonic() - wall_start
-        self._print_summary(wall_total)
-        return self.results
-
-    async def run_sequential(self) -> list[SubAgentResult]:
-        """Sequential fallback — debug বা rate-limit issue হলে ব্যবহার করো।"""
-        logger.info("🔄 [Orchestrator] Sequential mode (fallback)")
-        results = []
-        birthday_contacts = []
-
-        for name, factory in self._build_task_list():
-            # Birthday detection result capture করি
-            if name == "LinkedIn-BirthdayDetection":
-                r = await self._run_sub_agent(name, factory)
-                if r.status == AgentStatus.SUCCESS and isinstance(r.result, list):
-                    birthday_contacts = r.result
-                    self._birthday_contacts = birthday_contacts
-                results.append(r)
-
-            # Personality profiling-এ captured contacts pass করি
-            elif name == "Personality-Profiling":
-                r = await self._run_sub_agent(
-                    name,
-                    lambda: run_personality_profiling_task(birthday_contacts),
-                )
-                results.append(r)
-
-            else:
-                r = await self._run_sub_agent(name, factory)
-                results.append(r)
-
-        self.results = results
-        self._print_summary(0)
-        return results
-
-    def _print_summary(self, wall_time: float):
-        success = [r for r in self.results if r.status == AgentStatus.SUCCESS]
-        failed  = [r for r in self.results if r.status == AgentStatus.FAILED]
-        skipped = [r for r in self.results if r.status == AgentStatus.SKIPPED]
-
-        logger.info("=" * 60)
-        logger.info("📊 [Orchestrator] Run Complete")
-        if wall_time > 0:
-            agent_time = sum(r.duration_s for r in self.results)
-            speedup    = agent_time / wall_time if wall_time else 1
-            logger.info("   Wall time   : %.1fs", wall_time)
-            logger.info("   Agent work  : %.1fs", agent_time)
-            logger.info("   Speedup     : %.1fx (vs sequential)", speedup)
-        logger.info("   ✅ Success : %d", len(success))
-        logger.info("   ❌ Failed  : %d", len(failed))
-        logger.info("   ⏭️ Skipped : %d", len(skipped))
-        logger.info("-" * 60)
-        for r in self.results:
-            logger.info("   %s", r)
-        logger.info("=" * 60)
-
-        if failed:
-            logger.error("⚠️ Failed: %s",
-                         ", ".join(r.name for r in failed))
-
-
-# ──────────────────────────────────────────────
-# 15. DAILY JOB
-# ──────────────────────────────────────────────
-async def daily_job():
-    logger.info("⏰ Daily job started. PARALLEL_MODE=%s", PARALLEL_MODE)
-
-    orchestrator = OrchestratorAgent(
-        max_browser_concurrency=MAX_BROWSER_CONCURRENCY
-    )
-
-    if PARALLEL_MODE:
-        await orchestrator.run_parallel()
-    else:
-        await orchestrator.run_sequential()
-
-    # Weekly tasks
-    try:
+        # Contact categorizer (runs weekly on Sunday)
         if CONTACT_CATEGORIZER_ENABLED:
+            from datetime import date
             if date.today().strftime("%A") == "Sunday":
                 await run_categorizer_task()
 
-        if HEALTH_REPORT_ENABLED:
-            if date.today().strftime("%A").lower() == HEALTH_REPORT_DAY.lower():
-                await run_health_report_task()
-
+        # Weekly email digest (Mondays only)
         if EMAIL_DIGEST_ENABLED:
             if date.today().strftime("%A").lower() == DIGEST_DAY.lower():
                 await run_email_digest_task()
 
+        # Weekly relationship health report (Mondays only)
+        if HEALTH_REPORT_ENABLED:
+            from datetime import date
+            if date.today().strftime("%A").lower() == HEALTH_REPORT_DAY.lower():
+                await run_health_report_task()
+
     except Exception as e:
-        logger.error("❌ Weekly task error: %s", e)
+        logger.error("❌ Daily job error: %s", e)
 
 
 async def run_scheduler():
@@ -1251,7 +946,7 @@ async def run_scheduler():
 
 
 # ──────────────────────────────────────────────
-# 16. CLEANUP
+# 15. CLEANUP
 # ──────────────────────────────────────────────
 async def close_browser():
     try:
@@ -1262,7 +957,7 @@ async def close_browser():
 
 
 # ──────────────────────────────────────────────
-# 17. ENTRYPOINT
+# 16. ENTRYPOINT
 # ──────────────────────────────────────────────
 async def main():
     init_db()
@@ -1280,14 +975,13 @@ async def main():
     init_campaign_table()
     init_categorizer_table()
     init_ab_table()
-    init_personality_table()          # ← Personality Profiling DB init
-
+    init_personality_table()
     if RAG_MEMORY_ENABLED:
         init_rag_memory()
         migrate_from_sqlite_memory()
+    init_personality_table()  # One-time migration from SQLite
     if CONNECTION_TRACKER_ENABLED:
-        sync_from_history()
-
+        sync_from_history()  # Sync existing history into tracker
     try:
         # Run a single task immediately (uncomment to use):
         # await run_github_task()
@@ -1300,21 +994,23 @@ async def main():
         # await run_whatsapp_reply_task()
         # await run_facebook_reply_task()
         # await run_instagram_reply_task()
-        # await run_memory_wish_task()
-        # await run_post_engagement_task()
-        # await run_birthday_reminder_task()
-        # await run_group_birthday_task()
-        # await run_auto_reply_task()
-        # await run_occasion_detection_task()
-        # await run_health_report_task()
-        # await run_best_time_task()
-        # await run_dm_campaign_task()
-        # await run_categorizer_task()
-        # await run_rag_wish_task()
-        # await run_voice_to_text_reply_task()
-        # await run_personality_profiling_task()   # ← Personality Profiling (standalone)
+        # await run_memory_wish_task()         # Memory-aware wishes
+        # await run_post_engagement_task()    # Like + comment on posts
+        # await run_birthday_reminder_task()  # Reminder email for tomorrow's birthdays
+        # await run_group_birthday_task()      # Group birthday detection
+        # await run_auto_reply_task()           # Auto reply to follow-up responses
+        # await run_occasion_detection_task()  # Occasion detection & congratulations
+        # await run_health_report_task()        # Weekly relationship health report
+        # await run_email_digest_task()          # Weekly email digest
+        # await run_best_time_task()            # Analyze best time to connect
+        # await run_dm_campaign_task()          # LinkedIn DM campaign
+        # await run_categorizer_task()          # Auto-categorize contacts
+        # await run_personality_task()           # Personality profiling
+        # await run_rag_wish_task()             # RAG-based memory wishes
+        # await run_voice_to_text_reply_task()  # Voice note transcription & reply
+        # await run_personality_profiling_task()  # Profile contacts from LinkedIn posts
 
-        # Run ALL platforms on daily schedule (uses orchestrator):
+        # Run ALL platforms on daily schedule:
         await run_scheduler()
 
     finally:
