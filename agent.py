@@ -64,6 +64,14 @@ from predictive_birthday import (
     get_prediction_stats,
     get_todays_predicted_birthdays,
 )
+from emotional_intelligence import (
+    init_eq_table,
+    score_reply,
+    save_eq_score,
+    get_avg_eq_score,
+    build_eq_instructions,
+    get_eq_stats,
+)
 
 # ──────────────────────────────────────────────
 # 1. LOGGING SETUP
@@ -121,6 +129,10 @@ PERSONALITY_PROFILING_ENABLED = True
 PREDICTIVE_BIRTHDAY_ENABLED = True
 MAX_BIRTHDAY_PREDICTIONS    = 20
 PREDICTION_MIN_CONFIDENCE   = 'medium'
+
+# ── EMOTIONAL INTELLIGENCE ────────────────────
+EQ_SCORING_ENABLED = True
+EQ_MIN_SCORE_THRESHOLD = 70
 
 if not USERNAME or not PASSWORD:
     raise EnvironmentError("❌ USERNAME or PASSWORD missing in .env")
@@ -891,6 +903,20 @@ async def run_predictive_birthday_task(contacts: list[dict] = None):
     return wished
 
 
+async def run_eq_scoring_task(reply_text: str = "", contact: str = "", context: str = ""):
+    logger.info("=== EQ Scoring === [DRY RUN: %s]", DRY_RUN)
+    if not reply_text:
+        logger.info("No reply text provided for EQ scoring.")
+        return None
+    result = await score_reply(reply_text=reply_text, context=context, llm=llm)
+    save_eq_score(contact=contact, reply_text=reply_text, eq_score=result.get("eq_score", 0), breakdown=result.get("breakdown", {}), tips=result.get("improvement_tips", []))
+    avg = get_avg_eq_score()
+    logger.info("🧠 EQ Score for %s: %d/100 | Avg: %.1f", contact, result.get("eq_score", 0), avg)
+    stats = get_eq_stats()
+    logger.info("📊 EQ Stats: %s", stats)
+    return result
+
+
 async def daily_job():
     logger.info("⏰ Daily job started.")
     try:
@@ -1008,6 +1034,7 @@ async def main():
     init_ab_table()
     init_personality_table()
     init_predicted_birthday_table()
+    init_eq_table()
     if RAG_MEMORY_ENABLED:
         init_rag_memory()
         migrate_from_sqlite_memory()
@@ -1042,6 +1069,7 @@ async def main():
         # await run_voice_to_text_reply_task()  # Voice note transcription & reply
         # await run_personality_profiling_task()  # Profile contacts from LinkedIn posts
         # await run_predictive_birthday_task()   # ← Predictive Birthday (standalone)
+        # await run_eq_scoring_task()            # ← EQ Scoring (standalone)
 
         # Run ALL platforms on daily schedule:
         await run_scheduler()
