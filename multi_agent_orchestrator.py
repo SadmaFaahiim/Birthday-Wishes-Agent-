@@ -2,7 +2,7 @@
 multi_agent_orchestrator.py
 ============================
 Feature 4: Multi-Agent Architecture
--------------------------------------
+------------------------------------
 Orchestrator agent টা parallel এ multiple sub-agents চালায়।
 প্রতিটা sub-agent একটা নির্দিষ্ট কাজের জন্য responsible।
 asyncio.gather() দিয়ে সব একসাথে run হয় → overall speed অনেক বাড়ে।
@@ -165,6 +165,7 @@ class OrchestratorAgent:
         """
         sem = self._browser_sem if use_browser else self._light_sem
         start = time.monotonic()
+        last_error = None
 
         async with sem:
             logger.info("🤖 [Orchestrator] Starting sub-agent: %s", name)
@@ -181,6 +182,7 @@ class OrchestratorAgent:
                     logger.info("✅ [%s] Done in %.1fs", name, duration)
                     return r
                 except Exception as e:
+                    last_error = e
                     logger.warning(
                         "⚠️ [%s] Attempt %d/%d failed: %s",
                         name, attempt, self.cfg.retries, e,
@@ -192,7 +194,7 @@ class OrchestratorAgent:
             return SubAgentResult(
                 name=name,
                 status=AgentStatus.FAILED,
-                error=str(e),
+                error=str(last_error) if last_error else "Max retries exceeded",
                 duration_s=duration,
             )
 
