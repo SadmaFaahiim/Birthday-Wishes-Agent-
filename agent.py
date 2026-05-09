@@ -892,18 +892,63 @@ async def run_personality_profiling_task(contacts: list[dict] = None):
 
 
 async def run_predictive_birthday_task(contacts: list[dict] = None):
-    logger.info('=== Predictive Birthday === [DRY RUN: %s | MAX: %d | MIN_CONF: %s]', DRY_RUN, MAX_BIRTHDAY_PREDICTIONS, PREDICTION_MIN_CONFIDENCE)
+    logger.info(
+        '=== Predictive Birthday === [DRY RUN: %s | MAX: %d | MIN_CONF: %s]',
+        DRY_RUN,
+        MAX_BIRTHDAY_PREDICTIONS,
+        PREDICTION_MIN_CONFIDENCE
+    )
+
     if contacts:
-        results = await run_predictive_birthday(contacts=contacts, llm=llm, browser=browser, already_logged_in=session_is_valid(), username=USERNAME, password=PASSWORD, dry_run=DRY_RUN, max_predi[...]
-        today_count = sum(1 for r in results if r.get('is_birthday_today'))
-        logger.info('🔮 Predicted %d contacts | %d birthday today', len(results), today_count)
+        results = await run_predictive_birthday(
+            contacts=contacts,
+            llm=llm,
+            browser=browser,
+            already_logged_in=session_is_valid(),
+            username=USERNAME,
+            password=PASSWORD,
+            dry_run=DRY_RUN,
+        )
+
+        today_count = sum(
+            1 for r in results if r.get('is_birthday_today')
+        )
+
+        logger.info(
+            '🔮 Predicted %d contacts | %d birthday today',
+            len(results),
+            today_count
+        )
+
     else:
-        logger.info('📭 No new contacts to predict. Checking saved predictions...')
-    wished = await send_todays_predicted_wishes(llm=llm, browser=browser, already_logged_in=session_is_valid(), username=USERNAME, password=PASSWORD, dry_run=DRY_RUN)
+        logger.info(
+            '📭 No new contacts to predict. Checking saved predictions...'
+        )
+
+    wished = await send_todays_predicted_wishes(
+        llm=llm,
+        browser=browser,
+        already_logged_in=session_is_valid(),
+        username=USERNAME,
+        password=PASSWORD,
+        dry_run=DRY_RUN
+    )
+
     stats = get_prediction_stats()
-    logger.info('📊 Prediction DB: %d total | High: %d | Medium: %d | Low: %d | Wished: %d', stats['total'], stats['by_confidence'].get('high', 0), stats['by_confidence'].get('medium', 0), stat[...]
+
+    logger.info(
+        '📊 Prediction DB: %d total | High: %d | Medium: %d | Low: %d | Wished: %d',
+        stats['total'],
+        stats['by_confidence'].get('high', 0),
+        stats['by_confidence'].get('medium', 0),
+        stats['by_confidence'].get('low', 0),
+        stats.get('wished', 0)
+    )
+
     send_summary('Predictive Birthday', wished, 0, DRY_RUN)
+
     save_session_timestamp()
+
     return wished
 
 
