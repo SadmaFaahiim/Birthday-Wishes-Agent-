@@ -56,7 +56,8 @@ from email_digest import send_weekly_digest
 from voice import generate_voice
 from personality_profiling import (init_personality_table, analyze_personality,
                                    get_personality_profile,
-                                   build_personality_instructions)
+                                   build_personality_instructions,
+                                   run_personality_profiling)
 from predictive_birthday import (
     init_predicted_birthday_table,
     run_predictive_birthday,
@@ -137,6 +138,44 @@ EQ_MIN_SCORE_THRESHOLD = 70
 
 # ── CONNECTION TRACKER ────────────────────────
 CONNECTION_TRACKER_ENABLED = True
+
+# ── FEATURE FLAGS ─────────────────────────────
+MEMORY_ENABLED               = True
+POST_ENGAGEMENT_ENABLED      = False
+BIRTHDAY_REMINDER_ENABLED    = True
+GROUP_BIRTHDAY_ENABLED       = False
+AUTO_REPLY_FOLLOWUP_ENABLED  = True
+OCCASION_DETECTION_ENABLED   = False
+DM_CAMPAIGN_ENABLED          = False
+CONTACT_CATEGORIZER_ENABLED  = False
+EMAIL_DIGEST_ENABLED         = False
+HEALTH_REPORT_ENABLED        = False
+RAG_MEMORY_ENABLED           = False
+
+# ── DM CAMPAIGN SETTINGS ──────────────────────
+CAMPAIGN_TYPE     = "connection"   # "birthday", "followup", "connection"
+CAMPAIGN_VARIANT  = "A"
+MAX_DM_PER_DAY    = 10
+DM_COOLDOWN_DAYS  = 30
+
+# ── CONTACT CATEGORIZER SETTINGS ──────────────
+CATEGORIZER_MAX_CONTACTS = 50
+
+# ── AUTO REPLY SETTINGS ───────────────────────
+MAX_AUTO_REPLIES_PER_DAY = 20
+
+# ── GROUP ENGAGEMENT SETTINGS ─────────────────
+MAX_GROUP_ENGAGEMENTS  = 10
+GROUP_COMMENT_ENABLED  = True
+GROUP_DM_ENABLED       = False
+
+# ── POST ENGAGEMENT SETTINGS ──────────────────
+ENGAGEMENT_MODE          = "like_only"   # "comment", "both"
+MAX_ENGAGEMENTS_PER_DAY  = 15
+
+# ── DIGEST / REPORT SETTINGS ──────────────────
+DIGEST_DAY        = "monday"
+HEALTH_REPORT_DAY = "sunday"
 
 if not USERNAME or not PASSWORD:
     raise EnvironmentError("❌ USERNAME or PASSWORD missing in .env")
@@ -591,7 +630,6 @@ async def run_followup_task():
 async def run_memory_wish_task():
     """Send birthday wishes that reference last year's context."""
     logger.info("=== LinkedIn: Memory-Aware Wishes === [DRY RUN: %s]", DRY_RUN)
-    logged_in = session_is_valid()
 
     task = f"""
   Open the browser.
@@ -850,7 +888,6 @@ async def run_post_engagement_task():
     logger.info("=== LinkedIn Post Engagement === [DRY RUN: %s | MODE: %s]",
                 DRY_RUN, ENGAGEMENT_MODE)
 
-    # Sample contacts — in production these come from birthday detection result
     sample_contacts = [
         {"name": "Birthday Contact", "profile_url": "", "relationship": "colleague"}
     ]
@@ -946,9 +983,7 @@ async def run_predictive_birthday_task(contacts: list[dict] = None):
     )
 
     send_summary('Predictive Birthday', wished, 0, DRY_RUN)
-
     save_session_timestamp()
-
     return wished
 
 
@@ -987,48 +1022,36 @@ async def daily_job():
         if SENTIMENT_ANALYSIS_ENABLED or AUTO_CONNECT_ENABLED:
             await run_sentiment_reply_task()
 
-        # Memory-aware birthday wishes
         if MEMORY_ENABLED:
             await run_memory_wish_task()
 
-        # Post engagement (like + comment on birthday contacts' posts)
         if POST_ENGAGEMENT_ENABLED:
             await run_post_engagement_task()
 
-        # Birthday reminder email for tomorrow's birthdays
         if BIRTHDAY_REMINDER_ENABLED:
             await run_birthday_reminder_task()
 
-        # Group birthday detection
         if GROUP_BIRTHDAY_ENABLED:
             await run_group_birthday_task()
 
-        # Auto reply to follow-up responses
         if AUTO_REPLY_FOLLOWUP_ENABLED:
             await run_auto_reply_task()
 
-        # Occasion detection (promotion, new job, graduation, etc.)
         if OCCASION_DETECTION_ENABLED:
             await run_occasion_detection_task()
 
-        # LinkedIn DM Campaign
         if DM_CAMPAIGN_ENABLED:
             await run_dm_campaign_task()
 
-        # Contact categorizer (runs weekly on Sunday)
         if CONTACT_CATEGORIZER_ENABLED:
-            from datetime import date
             if date.today().strftime("%A") == "Sunday":
                 await run_categorizer_task()
 
-        # Weekly email digest (Mondays only)
         if EMAIL_DIGEST_ENABLED:
             if date.today().strftime("%A").lower() == DIGEST_DAY.lower():
                 await run_email_digest_task()
 
-        # Weekly relationship health report (Mondays only)
         if HEALTH_REPORT_ENABLED:
-            from datetime import date
             if date.today().strftime("%A").lower() == HEALTH_REPORT_DAY.lower():
                 await run_health_report_task()
 
@@ -1087,9 +1110,8 @@ async def main():
     if RAG_MEMORY_ENABLED:
         init_rag_memory()
         migrate_from_sqlite_memory()
-    init_personality_table()  # One-time migration from SQLite
     if CONNECTION_TRACKER_ENABLED:
-        sync_from_history()  # Sync existing history into tracker
+        sync_from_history()
     try:
         # Run a single task immediately (uncomment to use):
         # await run_github_task()
@@ -1102,23 +1124,23 @@ async def main():
         # await run_whatsapp_reply_task()
         # await run_facebook_reply_task()
         # await run_instagram_reply_task()
-        # await run_memory_wish_task()         # Memory-aware wishes
-        # await run_post_engagement_task()    # Like + comment on posts
-        # await run_birthday_reminder_task()  # Reminder email for tomorrow's birthdays
-        # await run_group_birthday_task()      # Group birthday detection
-        # await run_auto_reply_task()           # Auto reply to follow-up responses
-        # await run_occasion_detection_task()  # Occasion detection & congratulations
-        # await run_health_report_task()        # Weekly relationship health report
-        # await run_email_digest_task()          # Weekly email digest
-        # await run_best_time_task()            # Analyze best time to connect
-        # await run_dm_campaign_task()          # LinkedIn DM campaign
-        # await run_categorizer_task()          # Auto-categorize contacts
-        # await run_personality_task()           # Personality profiling
-        # await run_rag_wish_task()             # RAG-based memory wishes
-        # await run_voice_to_text_reply_task()  # Voice note transcription & reply
-        # await run_personality_profiling_task()  # Profile contacts from LinkedIn posts
-        # await run_predictive_birthday_task()   # ← Predictive Birthday (standalone)
-        # await run_eq_scoring_task()            # ← EQ Scoring (standalone)
+        # await run_memory_wish_task()
+        # await run_post_engagement_task()
+        # await run_birthday_reminder_task()
+        # await run_group_birthday_task()
+        # await run_auto_reply_task()
+        # await run_occasion_detection_task()
+        # await run_health_report_task()
+        # await run_email_digest_task()
+        # await run_best_time_task()
+        # await run_dm_campaign_task()
+        # await run_categorizer_task()
+        # await run_personality_task()
+        # await run_rag_wish_task()
+        # await run_voice_to_text_reply_task()
+        # await run_personality_profiling_task()
+        # await run_predictive_birthday_task()
+        # await run_eq_scoring_task()
 
         # Run ALL platforms on daily schedule:
         await run_scheduler()
