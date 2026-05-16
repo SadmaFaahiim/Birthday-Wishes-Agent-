@@ -1,4 +1,3 @@
-﻿"""
 wish_scorer.py
 --------------
 Wish Quality Scorer module for Birthday Wishes Agent.
